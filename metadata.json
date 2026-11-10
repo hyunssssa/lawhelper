@@ -1,0 +1,6 @@
+{
+  "name": "JurisPulse | Next-Gen Legal AI OS",
+  "description": "Institutional legal intelligence platform benchmarking law-bot.kr: contract review, toxic clause detection, statutory Q&A, and guided case triage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
