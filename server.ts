@@ -30,50 +30,67 @@ if (apiKey) {
   ai = new GoogleGenAI({ apiKey });
 }
 
+const GEMINI_FAST_POOL = [
+  'gemini-3.5-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-flash-lite-latest'
+];
+
 const GEMINI_MODEL_PRIORITY = [
+  ...GEMINI_FAST_POOL,
   'gemini-3.1-flash-lite-preview',
+  'gemini-3.8-flash',
+  'gemini-flash-latest',
   'gemini-3-flash-preview',
   'gemini-3.1-pro-preview'
 ];
 
-// Non-blocking Gemini helper with automatic model failover if any single model hits 429 Free Tier quota
-async function generateWithTimeout(params: any, timeoutMs = 22000): Promise<any> {
+let modelRoundRobinIndex = 0;
+
+// Non-blocking Gemini helper with round-robin load distribution + automatic model failover on 429/503/timeout
+async function generateWithTimeout(params: any, timeoutMs = 18000): Promise<any> {
   if (!ai) throw new Error('AI client not initialized');
+
+  const startIdx = modelRoundRobinIndex++ % GEMINI_FAST_POOL.length;
+  const rotatedFastPool = [
+    ...GEMINI_FAST_POOL.slice(startIdx),
+    ...GEMINI_FAST_POOL.slice(0, startIdx)
+  ];
+
   const candidateModels = [
-    'gemini-3.1-flash-lite-preview',
-    ...(params.model && params.model !== 'gemini-3.1-flash-lite-preview' ? [params.model] : []),
+    ...rotatedFastPool,
     ...GEMINI_MODEL_PRIORITY
   ].filter((v, i, a) => a.indexOf(v) === i);
 
   let lastError: any = null;
-  for (const modelName of candidateModels) {
-    try {
-      return await Promise.race([
-        ai.models.generateContent({ ...params, model: modelName }),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Gemini timeout after ${timeoutMs}ms`)), timeoutMs)
-        )
-      ]);
-    } catch (err: any) {
-      lastError = err;
-      const errStr = String(err?.message || err?.status || err || '');
-      if (
-        errStr.includes('429') ||
-        errStr.includes('RESOURCE_EXHAUSTED') ||
-        errStr.includes('404') ||
-        errStr.includes('503')
-      ) {
+  for (let pass = 0; pass < 2; pass++) {
+    for (const modelName of candidateModels) {
+      try {
+        return await Promise.race([
+          ai.models.generateContent({ ...params, model: modelName }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Gemini timeout after ${timeoutMs}ms`)), timeoutMs)
+          )
+        ]);
+      } catch (err: any) {
+        lastError = err;
+        // Immediately fail over to the next model in the pool on any error (503, 429, timeout, 404, etc.)
         continue;
       }
-      throw err;
     }
+    // Brief pause before second pass if all models experienced simultaneous burst
+    await new Promise((r) => setTimeout(r, 600));
   }
   throw lastError;
 }
 
-// Fault-tolerant parser that recovers both compact tuple rows ["YYYY-MM-DD","W",1500000,"적요",3200000]
-// and standard object rows {"date":"...","type":"...","amount":1500000,"counterpart":"...","balance":3200000}
-// even if the LLM output is truncated mid-stream or uses negative numbers for withdrawals.
+// Fault-tolerant parser that recovers:
+// 1. Visual column-order 5-tuples: ["YYYY-MM-DD", 출금액, 입금액, 거래후잔액, "거래내용/상대방"]
+// 2. Legacy W/D 5-tuples: ["YYYY-MM-DD", "W"|"D", 거래금액, "거래내용/적요", 거래후잔액]
+// 3. Standard JSON objects: {"date":"...","type":"...","amount":1500000,"counterpart":"...","balance":3200000}
+// and runs mathematical running-balance delta (B_i - B_{i-1}) verification to fix any balance/amount/type mixups.
 function salvageTransactionsFromOcrResponse(rawText: string): Array<{
   date: string;
   type: 'deposit' | 'withdrawal';
@@ -103,59 +120,224 @@ function salvageTransactionsFromOcrResponse(rawText: string): Array<{
     return { val: Math.abs(val), isNegative, isPositiveSign };
   };
 
+  const normalizeDateStr = (raw: string): string => {
+    const s = String(raw || '').trim();
+    const m = s.match(/(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})/);
+    if (m) {
+      return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+    }
+    const m8 = s.match(/(20\d{2})(\d{2})(\d{2})/);
+    if (m8) {
+      return `${m8[1]}-${m8[2]}-${m8[3]}`;
+    }
+    return s.split(/\s+/)[0] || '2025-10-01';
+  };
+
+  const isSummaryRowText = (d: string, c: string): boolean => {
+    return (
+      /합\s*계|총\s*계|소\s*계|누\s*계|이월잔액|출금합계|입금합계|거래내역\s*요약/.test(d) ||
+      /^(?:합\s*계|총\s*계|소\s*계|누\s*계|이월잔액|출금합계|입금합계)$/.test(c.trim())
+    );
+  };
+
   const pushNormalizedItem = (item: any) => {
     if (!item) return;
     if (Array.isArray(item) && item.length >= 3) {
-      const rawDate = String(item[0] || '2025-10-01').trim();
-      const rawType = String(item[1] || 'W').toUpperCase();
-      const parsedAmt = parseCurrencyVal(item[2]);
-      if (parsedAmt.val <= 0) return;
-      const counterpart = String(item[3] || '').trim();
-      const parsedBal = item[4] !== undefined && item[4] !== null ? parseCurrencyVal(item[4]) : null;
-      const isDeposit =
-        !parsedAmt.isNegative &&
-        (parsedAmt.isPositiveSign || rawType.startsWith('D') || rawType.includes('입금') || rawType.includes('맡기신'));
-      results.push({
-        date: rawDate,
-        type: isDeposit ? 'deposit' : 'withdrawal',
-        amount: parsedAmt.val,
-        counterpart: counterpart || (isDeposit ? '입금 거래' : '출금 거래'),
-        balance: parsedBal && parsedBal.val >= 0 ? parsedBal.val : null
-      });
+      const rawDate = String(item[0] || '').trim();
+      if (!rawDate || !/\d/.test(rawDate)) return;
+      const secondStr = String(item[1] ?? '').trim();
+      const isLegacyTypeToken = /^(?:W|D|WITHDRAWAL|DEPOSIT|출금|입금|지급|수취|찾으신|맡기신)/i.test(secondStr);
+
+      if (isLegacyTypeToken) {
+        // Legacy format: ["YYYY-MM-DD", "W"|"D", 거래금액, "거래내용", 거래후잔액]
+        const rawType = secondStr.toUpperCase();
+        const parsedAmt = parseCurrencyVal(item[2]);
+        if (parsedAmt.val <= 0) return;
+        const counterpart = String(item[3] || '').trim();
+        if (isSummaryRowText(rawDate, counterpart)) return;
+        const parsedBal = item[4] !== undefined && item[4] !== null ? parseCurrencyVal(item[4]) : null;
+        const isDeposit =
+          !parsedAmt.isNegative &&
+          (parsedAmt.isPositiveSign || rawType.startsWith('D') || rawType.includes('입금') || rawType.includes('맡기신'));
+        results.push({
+          date: normalizeDateStr(rawDate),
+          type: isDeposit ? 'deposit' : 'withdrawal',
+          amount: parsedAmt.val,
+          counterpart: counterpart || (isDeposit ? '입금 거래' : '출금 거래'),
+          balance: parsedBal && parsedBal.val >= 0 ? parsedBal.val : null
+        });
+      } else {
+        // Visual Korean bank table column order:
+        // ["YYYY-MM-DD", 출금액, 입금액, 거래후잔액, "거래내용/상대방"]
+        const wParsed = parseCurrencyVal(item[1]);
+        const dParsed = parseCurrencyVal(item[2]);
+        let balVal: number | null = null;
+        let counterpart = '';
+
+        if (item.length >= 5) {
+          const bParsed = item[3] !== undefined && item[3] !== null ? parseCurrencyVal(item[3]) : null;
+          balVal = bParsed && bParsed.val >= 0 ? bParsed.val : null;
+          counterpart = String(item[4] || '').trim();
+          if (item[5] && typeof item[5] === 'string' && item[5].trim()) {
+            counterpart = counterpart ? `${counterpart} (${item[5].trim()})` : item[5].trim();
+          }
+        } else if (item.length === 4) {
+          const fourthStr = String(item[3] ?? '').trim();
+          if (/^[+-]?[0-9,]+$/.test(fourthStr)) {
+            balVal = parseCurrencyVal(fourthStr).val;
+          } else {
+            counterpart = fourthStr;
+          }
+        }
+
+        if (isSummaryRowText(rawDate, counterpart)) return;
+
+        let txType: 'deposit' | 'withdrawal' = 'withdrawal';
+        let txAmount = 0;
+
+        if (wParsed.val > 0 && dParsed.val === 0) {
+          txType = 'withdrawal';
+          txAmount = wParsed.val;
+        } else if (dParsed.val > 0 && wParsed.val === 0) {
+          txType = 'deposit';
+          txAmount = dParsed.val;
+        } else if (wParsed.val > 0 && dParsed.val > 0) {
+          // If the model accidentally put the running balance into item[2], disambiguate
+          if (balVal !== null && dParsed.val === balVal && wParsed.val !== balVal) {
+            txType = 'withdrawal';
+            txAmount = wParsed.val;
+          } else if (balVal !== null && wParsed.val === balVal && dParsed.val !== balVal) {
+            txType = 'deposit';
+            txAmount = dParsed.val;
+          } else {
+            txType = 'withdrawal';
+            txAmount = wParsed.val;
+          }
+        }
+
+        if (txAmount <= 0) return;
+
+        results.push({
+          date: normalizeDateStr(rawDate),
+          type: txType,
+          amount: txAmount,
+          counterpart: counterpart || (txType === 'deposit' ? '입금 거래' : '출금 거래'),
+          balance: balVal
+        });
+      }
     } else if (typeof item === 'object') {
-      const rawAmtSource =
-        item.amount ??
-        item.txAmount ??
-        (Number(String(item.withdrawal ?? item.출금 ?? '0').replace(/[^0-9]/g, '')) > 0
-          ? `-${item.withdrawal ?? item.출금}`
-          : item.deposit ?? item.입금 ?? '0');
-      const parsedAmt = parseCurrencyVal(rawAmtSource);
-      if (parsedAmt.val <= 0) return;
-      const rawType = String(item.type || item.구분 || '').toLowerCase();
-      const hasDepositVal = Number(String(item.deposit ?? item.입금 ?? '0').replace(/[^0-9]/g, '')) > 0;
-      const isDep =
-        !parsedAmt.isNegative &&
-        (parsedAmt.isPositiveSign ||
-          hasDepositVal ||
-          rawType === 'deposit' ||
-          rawType === 'd' ||
-          rawType.includes('입금') ||
-          rawType.includes('맡기신'));
+      const wVal = parseCurrencyVal(item.withdrawal ?? item.출금 ?? item.출금액 ?? item.찾으신금액 ?? 0).val;
+      const dVal = parseCurrencyVal(item.deposit ?? item.입금 ?? item.입금액 ?? item.맡기신금액 ?? 0).val;
       const rawBalSource = item.balance ?? item.잔액 ?? item.거래후잔액;
       const parsedBal =
         rawBalSource !== undefined && rawBalSource !== null ? parseCurrencyVal(rawBalSource) : null;
+
+      let txType: 'deposit' | 'withdrawal' = 'withdrawal';
+      let txAmount = 0;
+
+      if (wVal > 0 && dVal === 0) {
+        txType = 'withdrawal';
+        txAmount = wVal;
+      } else if (dVal > 0 && wVal === 0) {
+        txType = 'deposit';
+        txAmount = dVal;
+      } else {
+        const parsedAmt = parseCurrencyVal(item.amount ?? item.txAmount ?? item.거래금액 ?? 0);
+        txAmount = parsedAmt.val;
+        const rawType = String(item.type || item.구분 || '').toLowerCase();
+        const isDep =
+          !parsedAmt.isNegative &&
+          (parsedAmt.isPositiveSign ||
+            dVal > 0 ||
+            rawType === 'deposit' ||
+            rawType === 'd' ||
+            rawType.includes('입금') ||
+            rawType.includes('맡기신'));
+        txType = isDep ? 'deposit' : 'withdrawal';
+      }
+
+      if (txAmount <= 0) return;
+      const rawDateStr = String(item.date || item.거래일자 || item.거래일시 || '2025-10-01').trim();
       const counterpartStr = String(
-        item.counterpart || item.description || item.적요 || item.내용 || (isDep ? '입금 거래' : '출금 거래')
+        item.counterpart || item.description || item.적요 || item.거래내용 || item.내용 || (txType === 'deposit' ? '입금 거래' : '출금 거래')
       ).trim();
+      if (isSummaryRowText(rawDateStr, counterpartStr)) return;
       results.push({
-        date: String(item.date || item.거래일자 || item.거래일시 || '2025-10-01').trim(),
-        type: isDep ? 'deposit' : 'withdrawal',
-        amount: parsedAmt.val,
+        date: normalizeDateStr(rawDateStr),
+        type: txType,
+        amount: txAmount,
         counterpart: counterpartStr,
         balance: parsedBal && parsedBal.val >= 0 ? parsedBal.val : null,
         category: item.category
       });
     }
+  };
+
+  // Helper: Verify consecutive rows using running balance delta (B_i - B_{i-1})
+  const verifyWithRunningBalances = (rows: typeof results) => {
+    if (rows.length < 2) return rows;
+
+    // Determine whether the page table is ordered oldest-to-newest (ascending) or newest-to-oldest (descending)
+    let ascMatches = 0;
+    let descMatches = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const prev = rows[i - 1];
+      const curr = rows[i];
+      if (prev.balance === null || curr.balance === null) continue;
+      const ascDelta = curr.balance - prev.balance;
+      const descDelta = prev.balance - curr.balance;
+      if (Math.abs(ascDelta) === curr.amount && ascDelta !== 0) ascMatches++;
+      if (Math.abs(descDelta) === prev.amount && descDelta !== 0) descMatches++;
+    }
+    const isDescending = descMatches > ascMatches && descMatches >= 2;
+
+    if (!isDescending) {
+      for (let i = 1; i < rows.length; i++) {
+        const prev = rows[i - 1];
+        const curr = rows[i];
+        if (prev.balance === null || curr.balance === null) continue;
+        const delta = curr.balance - prev.balance;
+        if (delta === 0) continue;
+        const absDelta = Math.abs(delta);
+        const expectedType: 'deposit' | 'withdrawal' = delta > 0 ? 'deposit' : 'withdrawal';
+
+        // Case 1: Model got the exact amount right, but flipped deposit/withdrawal
+        if (curr.amount === absDelta && curr.type !== expectedType) {
+          curr.type = expectedType;
+        }
+        // Case 2: Model accidentally put the running balance itself into the amount field
+        else if (
+          (curr.amount === curr.balance || curr.amount === prev.balance) &&
+          absDelta > 0 &&
+          absDelta < Math.max(curr.balance, prev.balance)
+        ) {
+          curr.amount = absDelta;
+          curr.type = expectedType;
+        }
+      }
+    } else {
+      for (let i = 0; i < rows.length - 1; i++) {
+        const curr = rows[i];
+        const older = rows[i + 1];
+        if (curr.balance === null || older.balance === null) continue;
+        const delta = curr.balance - older.balance;
+        if (delta === 0) continue;
+        const absDelta = Math.abs(delta);
+        const expectedType: 'deposit' | 'withdrawal' = delta > 0 ? 'deposit' : 'withdrawal';
+
+        if (curr.amount === absDelta && curr.type !== expectedType) {
+          curr.type = expectedType;
+        } else if (
+          (curr.amount === curr.balance || curr.amount === older.balance) &&
+          absDelta > 0 &&
+          absDelta < Math.max(curr.balance, older.balance)
+        ) {
+          curr.amount = absDelta;
+          curr.type = expectedType;
+        }
+      }
+    }
+    return rows;
   };
 
   // 1. Try full JSON parse first
@@ -170,15 +352,30 @@ function salvageTransactionsFromOcrResponse(rawText: string): Array<{
       : null;
     if (list) {
       for (const it of list) pushNormalizedItem(it);
-      if (results.length > 0) return results;
+      if (results.length > 0) return verifyWithRunningBalances(results);
     }
   } catch (_) {
     // Fall through to regex salvage if JSON was truncated
   }
 
-  // 2. Salvage compact array tuples: ["2025-10-12", "W", 1500000, "김은진", 3400000] (supports negative/quoted numbers)
+  // 2A. Salvage visual column-order 5-tuples: ["2025-10-12", 500000, 0, 22284511, "주식회사 더케이"]
+  const visualTupleMatches = clean.matchAll(
+    /\[\s*"(20\d{2}[^"]*|\d{2}[.\-/]\d{2}[^"]*)"\s*,\s*"?([+-]?[0-9,]+)"?\s*,\s*"?([+-]?[0-9,]+)"?\s*,\s*"?([+-]?[0-9,]+|null)"?\s*,\s*"([^"]*)"\s*\]/g
+  );
+  for (const m of visualTupleMatches) {
+    pushNormalizedItem([
+      m[1],
+      m[2],
+      m[3],
+      m[4] && m[4] !== 'null' ? m[4] : null,
+      m[5] || ''
+    ]);
+  }
+  if (results.length > 0) return verifyWithRunningBalances(results);
+
+  // 2B. Salvage legacy W/D array tuples: ["2025-10-12", "W", 1500000, "김은진", 3400000]
   const tupleMatches = clean.matchAll(
-    /\[\s*"(20\d{2}[^"]*|\d{2}[.\-/]\d{2}[^"]*)"\s*,\s*"([^"]*)"\s*,\s*"?([+-]?[0-9,]+)"?\s*(?:,\s*"([^"]*)"\s*)?(?:,\s*"?([+-]?[0-9,]+|null)"?\s*)?\]/g
+    /\[\s*"(20\d{2}[^"]*|\d{2}[.\-/]\d{2}[^"]*)"\s*,\s*"([A-Za-z가-힣]+)"\s*,\s*"?([+-]?[0-9,]+)"?\s*(?:,\s*"([^"]*)"\s*)?(?:,\s*"?([+-]?[0-9,]+|null)"?\s*)?\]/g
   );
   for (const m of tupleMatches) {
     pushNormalizedItem([
@@ -189,10 +386,10 @@ function salvageTransactionsFromOcrResponse(rawText: string): Array<{
       m[5] && m[5] !== 'null' ? m[5] : null
     ]);
   }
-  if (results.length > 0) return results;
+  if (results.length > 0) return verifyWithRunningBalances(results);
 
   // 3. Salvage standard JSON objects: { "date": "...", ..., "amount": 1500000, ... }
-  const objMatches = clean.matchAll(/\{[^{}]*"(?:amount|withdrawal|deposit|출금|입금)"\s*:\s*[0-9,"+\-\s]+[^{}]*\}/g);
+  const objMatches = clean.matchAll(/\{[^{}]*"(?:amount|withdrawal|deposit|출금|입금|출금액|입금액)"\s*:\s*[0-9,"+\-\s]+[^{}]*\}/g);
   for (const m of objMatches) {
     try {
       const obj = JSON.parse(m[0]);
@@ -202,7 +399,7 @@ function salvageTransactionsFromOcrResponse(rawText: string): Array<{
     }
   }
 
-  return results;
+  return verifyWithRunningBalances(results);
 }
 
 // Extract coordinate-sorted lines from a PDF buffer using pdfjs-dist with Korean CMap support
@@ -332,6 +529,16 @@ async function extractStreamTextWithPdfParse(buffer: Buffer): Promise<string> {
   }
 }
 
+// Helper: Normalize Korean bank names and document titles (e.g. fix typos like 포스뱅크 -> 토스은행)
+function normalizeBankAndFileName(name: string): string {
+  if (!name) return name;
+  return name
+    .replace(/포스\s*(?:뱅크|은행)/gi, '토스은행')
+    .replace(/^포스\b/gi, '토스은행')
+    .replace(/포스\s+(\d)/gi, '토스은행 $1')
+    .replace(/포스\s*거래내역/gi, '토스은행 거래내역');
+}
+
 // Helper: Extract all transactions from coordinate-sorted PDF, stream PDF, or Excel text
 function extractTransactionsFromRawText(
   text: string,
@@ -356,7 +563,15 @@ function extractTransactionsFromRawText(
     .filter((l) => l.length > 0 && !/^--\s*\d+\s*of\s*\d+\s*--$/i.test(l));
 
   const results: any[] = [];
-  const cleanBankName = sourceFileName.replace(/\.[^/.]+$/, '');
+  const rawClean = sourceFileName.replace(/\.[^/.]+$/, '');
+  let cleanBankName = normalizeBankAndFileName(rawClean);
+
+  // Document-content bank auto-detection (e.g. if file contains '토스뱅크' or '토스은행' or typo '포스' was in filename)
+  if (/토스\s*(?:뱅크|은행)|toss\s*bank/i.test(expandedText)) {
+    if (/포스/i.test(cleanBankName) || !cleanBankName || cleanBankName === '금융기관') {
+      cleanBankName = '토스은행';
+    }
+  }
   const allClientNames = [clientName, ...clientAliases].map((n) => n.trim()).filter(Boolean);
 
   // Detect column header order: whether Deposit (입금/맡기신/수취) comes before Withdrawal (출금/찾으신/지급)
@@ -381,8 +596,8 @@ function extractTransactionsFromRawText(
   const longUnhyphenatedAcctRegex = /\b\d{10,16}\b/g;
 
   const isMetadataHeaderLine = (s: string) =>
-    /조회기간|거래기간|총\s*입금|총\s*출금|입금합계|출금합계|합계금액|발급일시|출력일시|작성일시|기준일시|평균잔액|계좌번호\s*[:\t\d]|예금주\s*[:\t]|^Page\s+\d+\s*\/\s*\d+/i.test(
-      s
+    /^(?:합\s*계|총\s*계|소\s*계|누\s*계|이월잔액|거래합계|월\s*계)(?:\s|\t|:|\d|$)|조회기간|거래기간|총\s*입금|총\s*출금|입금합계|출금합계|합계금액|합계건수|발급일시|출력일시|작성일시|기준일시|평균잔액|계좌번호\s*[:\t\d]|예금주\s*[:\t]|^Page\s+\d+\s*\/\s*\d+/i.test(
+      s.trim()
     ) ||
     (/거래일자|거래일시|거래날짜/.test(s) && /잔액|적요|출금|입금|내용|기재/.test(s));
 
@@ -786,7 +1001,13 @@ function extractTransactionsFromRawText(
       sourceCategory,
       appliedThreshold: threshold,
       _rawBalance: currentBalance,
-      _rawCandidates: effectiveCluster.map((c) => c.val)
+      _rawCandidates:
+        effectiveCluster.length >= 2
+          ? effectiveCluster.slice(0, effectiveCluster.length - 1).map((c) => c.val)
+          : effectiveCluster.map((c) => c.val),
+      _unambiguousZeroCol:
+        effectiveCluster.length === 3 &&
+        effectiveCluster[0].isZero !== effectiveCluster[1].isZero
     };
 
     reclassifyTransaction(txObj, allClientNames, threshold);
@@ -794,22 +1015,23 @@ function extractTransactionsFromRawText(
   }
 
   // Post-extraction verification pass using consecutive row balance delta (|잔액_i - 잔액_{i-1}|)
-  // Guarantees that if a row's extracted amount accidentally matched its post-transaction balance while another candidate on the row equals the true balance delta, it is corrected.
+  // Guarantees that if a row's extracted amount accidentally matched its post-transaction balance while another non-balance candidate on the row equals the true balance delta, it is corrected.
   for (let i = 1; i < results.length; i++) {
     const prev = results[i - 1];
     const curr = results[i];
     if (
+      !curr._unambiguousZeroCol &&
       typeof prev._rawBalance === 'number' &&
       typeof curr._rawBalance === 'number' &&
       Array.isArray(curr._rawCandidates) &&
-      curr._rawCandidates.length >= 2
+      curr._rawCandidates.length >= 1
     ) {
       const delta = Math.abs(curr._rawBalance - prev._rawBalance);
-      if (delta >= 0 && Math.abs(curr.amount - delta) > 1000) {
-        const matchingCandidate = curr._rawCandidates.find((v: number) => Math.abs(v - delta) <= 1000);
-        if (typeof matchingCandidate === 'number') {
+      if (delta > 0 && curr.amount !== delta) {
+        const matchingCandidate = curr._rawCandidates.find((v: number) => v === delta);
+        if (typeof matchingCandidate === 'number' && matchingCandidate > 0) {
           curr.amount = matchingCandidate;
-          if (curr.sourceCategory !== 'card' && delta > 0) {
+          if (curr.sourceCategory !== 'card') {
             curr.type = curr._rawBalance > prev._rawBalance ? 'deposit' : 'withdrawal';
           }
           curr.isFlagged = curr.amount >= threshold;
@@ -830,15 +1052,22 @@ function extractTransactionsFromRawText(
   for (const r of results) {
     delete r._rawBalance;
     delete r._rawCandidates;
+    delete r._unambiguousZeroCol;
   }
 
   return results;
 }
 
 function reclassifyTransaction(txObj: any, allClientNames: string[], threshold: number) {
-  const { counterpart, amount, type } = txObj;
+  const { counterpart = '', amount = 0, type = 'withdrawal' } = txObj;
   const isDeposit = type === 'deposit';
-  const isSelfTransfer = allClientNames.some((alias) => alias && counterpart.includes(alias));
+  const cleanCounterpartNoSpace = counterpart.replace(/\s+/g, '');
+  const isSelfTransfer = allClientNames.some((alias) => {
+    if (!alias) return false;
+    const cleanAlias = alias.replace(/\s+/g, '');
+    if (!cleanAlias) return false;
+    return counterpart.includes(alias) || cleanCounterpartNoSpace.includes(cleanAlias);
+  });
 
   if (isSelfTransfer) {
     txObj.category = 'self_transfer';
@@ -863,7 +1092,7 @@ function reclassifyTransaction(txObj: any, allClientNames: string[], threshold: 
     txObj.flagReason = '친인척 송금 — 재산은닉 또는 특정채권자 편파변제 소명 대상';
     txObj.courtRiskLevel = 'high';
     txObj.explanationStatus = 'needed';
-  } else if (/업비트|빗썸|코인|케이뱅크|두나무|가상자산|골프|카지노|토토|복권|마사회/.test(counterpart)) {
+  } else if (/업비트|빗썸|코인원|코빗|두나무|가상자산|비트코인|골프|카지노|토토|복권|마사회|경마|경륜/.test(counterpart)) {
     txObj.category = 'gambling_crypto';
     txObj.categoryLabel = '사행성·가상자산';
     txObj.isFlagged = true;
@@ -909,12 +1138,16 @@ app.post('/api/analyze-statement', async (req, res) => {
     mimeType: string;
     extractedText?: string;
     ocrPageImages?: string[];
-  }> =
+  }> = (
     Array.isArray(files) && files.length > 0
       ? files
       : fileBase64 || rawText || (Array.isArray(ocrPageImages) && ocrPageImages.length > 0)
       ? [{ name: title, fileBase64, mimeType, extractedText: rawText, ocrPageImages }]
-      : [];
+      : []
+  ).map((f) => ({
+    ...f,
+    name: normalizeBankAndFileName(f.name)
+  }));
 
   const extractedTransactions: any[] = [];
   const scannedFilesNeedingOcr: Array<{
@@ -1056,26 +1289,36 @@ app.post('/api/analyze-statement', async (req, res) => {
     );
   }
 
-  // Run Gemini 3.1 Flash Lite Vision/Document OCR on scanned or image-based PDFs in 2-page high-precision batches
+  // Run Multi-Model Parallel Vision/Document OCR on scanned or image-based PDFs (1 page per Gemini call, 4 pages in parallel)
   if (ai && scannedFilesNeedingOcr.length > 0) {
     for (const scannedFile of scannedFilesNeedingOcr) {
-      const cleanBankName = scannedFile.name.replace(/\.[^/.]+$/, '');
+      const cleanBankName = normalizeBankAndFileName(scannedFile.name.replace(/\.[^/.]+$/, ''));
+      const scannedCategory: 'bank' | 'card' | 'crypto' =
+        (scannedFile as any).categoryType === 'card'
+          ? 'card'
+          : (scannedFile as any).categoryType === 'crypto'
+          ? 'crypto'
+          : 'bank';
+      const scannedThreshold = Number((scannedFile as any).threshold) || threshold;
+
       const ocrPrompt = `대한민국 은행·금융기관 거래내역서("${scannedFile.name}") 페이지입니다.
-단 1건의 생략·요약·누락도 없이, 금액의 크고 작음(0원, 1원~수억원)과 무관하게 페이지 표에 있는 모든 입출금 거래내역 행(Row)을 위에서 아래 순서대로 100% 전수 추출하여 아래의 간결한 JSON 형식으로만 출력하십시오:
-{"txs":[["YYYY-MM-DD","W",거래금액,"적요/거래내용",거래후잔액],["YYYY-MM-DD","D",거래금액,"적요/거래내용",거래후잔액]]}
-규칙:
-- 절대 일부만 발췌하거나 중간을 생략하지 마십시오. 표의 첫 번째 줄부터 마지막 줄까지 모든 거래를 빠짐없이 전부 포함해야 합니다.
-- [매우 중요] 3번째 값에는 반드시 '거래금액(입금액 또는 출금액)'만 넣고, 절대 '거래 후 잔액(잔액)'을 거래금액 자리에 넣지 마십시오! (예: 거래금액이 1원, -9,900원이고 거래 후 잔액이 2,423,553원인 경우 3번째 값은 1 또는 9900이며, 2423553은 5번째 거래후잔액입니다.)
-- 출금(찾으신금액/지급/체크카드/-금액)은 "W", 입금(맡기신금액/수취/+금액)은 "D"로 표기
-- 금액과 잔액은 부호나 콤마 없는 양의 정수(절대값)로 표기 (예: 9900)
+표의 왼쪽부터 오른쪽 열 순서(거래일시 | 출금액 | 입금액 | 거래후잔액 | 거래내용·적요·상대은행) 그대로, 단 1건의 생략·요약·누락 없이 페이지의 모든 개별 거래 행(Row)을 위에서 아래 순서대로 100% 전수 추출하여 아래 JSON 형식으로만 출력하십시오:
+{"txs":[["YYYY-MM-DD",출금액,입금액,거래후잔액,"거래내용/상대방"],["YYYY-MM-DD",0,입금액,거래후잔액,"거래내용/상대방"]]}
+필수 규칙:
+- 표의 첫 번째 줄부터 마지막 줄까지 모든 개별 거래 행을 빠짐없이 포함하십시오. 단, 표 맨 아래나 맨 위의 "합계"/"총계"/"소계" 요약 줄은 제외하십시오.
+- 출금(찾으신금액/지급/체크카드/-금액) 칸에 금액이 있으면 [날짜, 출금액, 0, 거래후잔액, "거래내용"]으로 적고, 입금(맡기신금액/수취/+금액) 칸에 금액이 있으면 [날짜, 0, 입금액, 거래후잔액, "거래내용"]으로 적으십시오.
+- [매우 중요] 2번째 값(출금액)과 3번째 값(입금액) 자리에 절대 4번째 값인 '거래 후 잔액'을 넣지 마십시오. 이전 행 잔액과 현재 행 잔액의 차이(|현재잔액 - 이전잔액|)가 실제 거래금액(출금액 또는 입금액)입니다.
+- 5번째 값에는 '거래내용'(또는 적요/받는분/보낸분/가맹점명)을 적고, 상대은행 칸에 은행명이 있으면 "거래내용 (상대은행)" 형태로 적으십시오. 거래내용이 빈칸이면 상대은행명 또는 "출금 거래"/"입금 거래"로 적으십시오.
+- 모든 금액과 잔액은 부호나 콤마 없는 양의 정수로 표기하십시오 (예: 500000).
 - 마크다운 코드블록 없이 순수 JSON만 출력하십시오.`;
 
       const fileOcrTransactions: any[] = [];
       const pushSalvagedRows = (rows: ReturnType<typeof salvageTransactionsFromOcrResponse>) => {
         for (const rawTx of rows) {
           const amt = Math.abs(Number(rawTx.amount) || 0);
-          if (amt < 0) continue;
-          const txType: 'deposit' | 'withdrawal' = rawTx.type === 'deposit' ? 'deposit' : 'withdrawal';
+          if (amt <= 0) continue;
+          const txType: 'deposit' | 'withdrawal' =
+            scannedCategory === 'card' ? 'withdrawal' : rawTx.type === 'deposit' ? 'deposit' : 'withdrawal';
           const txObj: any = {
             id: `tx-ocr-${Date.now()}-${extractedTransactions.length + fileOcrTransactions.length + 1}-${Math.random().toString(36).slice(2, 6)}`,
             date: rawTx.date || '2025-10-01',
@@ -1087,52 +1330,110 @@ app.post('/api/analyze-statement', async (req, res) => {
               rawTx.balance !== null && rawTx.balance !== undefined
                 ? `잔액 ₩${Number(rawTx.balance).toLocaleString()}`
                 : '스캔OCR추출',
-            category: rawTx.category || 'general',
-            categoryLabel: '일반 거래',
-            isFlagged: amt >= threshold,
+            category: scannedCategory === 'card' ? 'card_settlement' : rawTx.category || 'general',
+            categoryLabel: scannedCategory === 'card' ? '카드대금/결제' : '일반 거래',
+            isFlagged: amt >= scannedThreshold,
             flagReason:
-              amt >= 500000
-                ? `50만원 이상 고액 ${txType === 'deposit' ? '입금' : '출금'} (₩${amt.toLocaleString()}원) 소명 대상`
+              amt >= scannedThreshold
+                ? `${(scannedThreshold / 10000).toLocaleString()}만원 이상 고액 ${
+                    scannedCategory === 'card' ? '카드사용' : txType === 'deposit' ? '입금' : '출금'
+                  } (₩${amt.toLocaleString()}원) 소명 대상`
                 : undefined,
-            courtRiskLevel: amt >= threshold ? 'high' : 'normal',
-            explanationStatus: amt >= threshold ? 'needed' : 'exempt',
-            explanationNote: ''
+            courtRiskLevel: amt >= scannedThreshold ? 'high' : 'normal',
+            explanationStatus: amt >= scannedThreshold ? 'needed' : 'exempt',
+            explanationNote: '',
+            sourceCategory: scannedCategory,
+            appliedThreshold: scannedThreshold
           };
-          reclassifyTransaction(txObj, [clientName, ...allClientAliases], threshold);
+          reclassifyTransaction(txObj, [clientName, ...allClientAliases], scannedThreshold);
           fileOcrTransactions.push(txObj);
         }
       };
 
       try {
-        // Path A: Client sent compressed JPEG page images (ocrPageImages) — process 2 pages per Gemini call for zero truncation
+        // Path A: Client sent page batches (either 1-page PDFs or rendered JPEG/PNG page images in ocrPageImages)
         if (Array.isArray(scannedFile.ocrPageImages) && scannedFile.ocrPageImages.length > 0) {
-          const imgBatchSize = 2;
-          const imageBatches: string[][] = [];
-          for (let i = 0; i < scannedFile.ocrPageImages.length; i += imgBatchSize) {
-            imageBatches.push(scannedFile.ocrPageImages.slice(i, i + imgBatchSize));
-          }
-
-          for (let b = 0; b < imageBatches.length; b += 2) {
-            const pair = imageBatches.slice(b, b + 2);
+          const pages = scannedFile.ocrPageImages;
+          const parallelCount = 4;
+          for (let b = 0; b < pages.length; b += parallelCount) {
+            const slice = pages.slice(b, b + parallelCount);
             const batchResults = await Promise.all(
-              pair.map(async (imgs) => {
+              slice.map(async (imgB64) => {
                 try {
-                  const contents: any[] = imgs.map((imgB64) => ({
-                    inlineData: {
-                      mimeType: 'image/jpeg',
-                      data: imgB64.includes(',') ? imgB64.split(',')[1] : imgB64
+                  const cleanB64 = imgB64.includes(',') ? imgB64.split(',')[1].trim() : imgB64.trim();
+                  const isPdfPage = cleanB64.startsWith('JVBERi0');
+                  const pageMimeType = isPdfPage
+                    ? 'application/pdf'
+                    : cleanB64.startsWith('iVBOR')
+                    ? 'image/png'
+                    : 'image/jpeg';
+
+                  // Only use fast coordinate text on a 1-page PDF if it genuinely contains a full digital table (>=250 chars & >=5 rows)
+                  if (isPdfPage) {
+                    try {
+                      const pageBuf = Buffer.from(cleanB64, 'base64');
+                      const coordTxt = await extractCoordinateSortedTextFromPdf(pageBuf);
+                      if (coordTxt && coordTxt.trim().length >= 250) {
+                        const fastTxs = extractTransactionsFromRawText(
+                          coordTxt,
+                          clientName,
+                          scannedThreshold,
+                          scannedFile.name,
+                          allClientAliases,
+                          scannedCategory
+                        );
+                        if (fastTxs.length >= 5) {
+                          return fastTxs.map((ft) => ({
+                            date: ft.date,
+                            type: ft.type,
+                            amount: ft.amount,
+                            counterpart: ft.counterpart,
+                            balance: null,
+                            category: ft.category
+                          }));
+                        }
+                      }
+                    } catch (_) {
+                      // Fall through to Gemini Vision/Document OCR
                     }
-                  }));
-                  contents.push(ocrPrompt);
+                  }
+
                   const resp = await generateWithTimeout(
                     {
-                      model: 'gemini-3.1-flash-lite-preview',
-                      contents,
+                      model: 'gemini-3.5-flash',
+                      contents: [
+                        {
+                          inlineData: {
+                            mimeType: pageMimeType,
+                            data: cleanB64
+                          }
+                        },
+                        ocrPrompt
+                      ],
                       config: { maxOutputTokens: 8192, temperature: 0.1 }
                     },
-                    30000
+                    22000
                   );
-                  return salvageTransactionsFromOcrResponse(resp.text || '');
+                  const salvaged = salvageTransactionsFromOcrResponse(resp.text || '');
+                  if (salvaged.length > 0) return salvaged;
+
+                  // Final fallback if Gemini returned plain text lines instead of JSON
+                  const fallbackTxs = extractTransactionsFromRawText(
+                    resp.text || '',
+                    clientName,
+                    scannedThreshold,
+                    scannedFile.name,
+                    allClientAliases,
+                    scannedCategory
+                  );
+                  return fallbackTxs.map((ft) => ({
+                    date: ft.date,
+                    type: ft.type,
+                    amount: ft.amount,
+                    counterpart: ft.counterpart,
+                    balance: null,
+                    category: ft.category
+                  }));
                 } catch (_) {
                   return [];
                 }
@@ -1143,61 +1444,56 @@ app.post('/api/analyze-statement', async (req, res) => {
             }
           }
         }
-        // Path B: Server-side PDF chunking with pdf-lib (splits multi-page PDF into 2-page sub-PDFs up to 150 pages)
+        // Path B: Server-side PDF chunking with pdf-lib (splits multi-page PDF into 1-page sub-PDFs across all pages)
         else if (scannedFile.fileBase64) {
           const rawBuf = Buffer.from(scannedFile.fileBase64, 'base64');
           const lower = scannedFile.name.toLowerCase();
           if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
             const resp = await generateWithTimeout(
               {
-                model: 'gemini-3.1-flash-lite-preview',
+                model: 'gemini-flash-lite-latest',
                 contents: [
                   { inlineData: { mimeType: scannedFile.mimeType || 'image/jpeg', data: scannedFile.fileBase64 } },
                   ocrPrompt
                 ],
                 config: { maxOutputTokens: 8192, temperature: 0.1 }
               },
-              30000
+              18000
             );
             pushSalvagedRows(salvageTransactionsFromOcrResponse(resp.text || ''));
           } else {
             const srcDoc = await PDFDocument.load(rawBuf, { ignoreEncryption: true });
             const totalPages = srcDoc.getPageCount();
-            const pagesPerChunk = 2;
-            const maxPagesToOcr = Math.min(totalPages, 150);
             const chunkBase64List: string[] = [];
 
-            if (totalPages <= pagesPerChunk && rawBuf.length <= 12 * 1024 * 1024) {
+            if (totalPages === 1 && rawBuf.length <= 12 * 1024 * 1024) {
               chunkBase64List.push(scannedFile.fileBase64);
             } else {
-              for (let startP = 0; startP < maxPagesToOcr; startP += pagesPerChunk) {
+              for (let p = 0; p < totalPages; p++) {
                 const subDoc = await PDFDocument.create();
-                const indices: number[] = [];
-                for (let p = startP; p < Math.min(startP + pagesPerChunk, maxPagesToOcr); p++) {
-                  indices.push(p);
-                }
-                const copied = await subDoc.copyPages(srcDoc, indices);
-                copied.forEach((cp) => subDoc.addPage(cp));
+                const [copied] = await subDoc.copyPages(srcDoc, [p]);
+                subDoc.addPage(copied);
                 const subBytes = await subDoc.save();
                 chunkBase64List.push(Buffer.from(subBytes).toString('base64'));
               }
             }
 
-            for (let c = 0; c < chunkBase64List.length; c += 2) {
-              const pair = chunkBase64List.slice(c, c + 2);
-              const pairResults = await Promise.all(
-                pair.map(async (chunkB64) => {
+            const parallelCount = 4;
+            for (let c = 0; c < chunkBase64List.length; c += parallelCount) {
+              const slice = chunkBase64List.slice(c, c + parallelCount);
+              const sliceResults = await Promise.all(
+                slice.map(async (chunkB64) => {
                   try {
                     const resp = await generateWithTimeout(
                       {
-                        model: 'gemini-3.1-flash-lite-preview',
+                        model: 'gemini-flash-lite-latest',
                         contents: [
                           { inlineData: { mimeType: 'application/pdf', data: chunkB64 } },
                           ocrPrompt
                         ],
                         config: { maxOutputTokens: 8192, temperature: 0.1 }
                       },
-                      30000
+                      20000
                     );
                     return salvageTransactionsFromOcrResponse(resp.text || '');
                   } catch (_) {
@@ -1205,7 +1501,7 @@ app.post('/api/analyze-statement', async (req, res) => {
                   }
                 })
               );
-              for (const rows of pairResults) {
+              for (const rows of sliceResults) {
                 pushSalvagedRows(rows);
               }
             }
@@ -1219,11 +1515,11 @@ app.post('/api/analyze-statement', async (req, res) => {
             const textSlice = fullTxt.slice(offset, offset + chunkLen);
             const resp = await generateWithTimeout(
               {
-                model: 'gemini-3.1-flash-lite-preview',
+                model: 'gemini-flash-lite-latest',
                 contents: `${ocrPrompt}\n\n[문서 추출 원문 텍스트]:\n${textSlice}`,
                 config: { maxOutputTokens: 8192, temperature: 0.1 }
               },
-              28000
+              20000
             );
             pushSalvagedRows(salvageTransactionsFromOcrResponse(resp.text || ''));
           }
@@ -1919,38 +2215,230 @@ Do not include markdown fences.`;
 
 // ---------------------------------------------------------------------------
 // API Route 6: Parse Korean Court Order / Notice PDF & Case Number Lookup (/api/parse-court-doc)
+// Sequentially parses ALL pages (1 .. totalPages) for both digital and scanned court PDFs
 // ---------------------------------------------------------------------------
 app.post('/api/parse-court-doc', async (req, res) => {
   try {
-    const { fileName = '', pdfBase64 = '', rawText = '', caseNoHint = '' } = req.body || {};
-    let combinedText = String(rawText || '');
+    const {
+      fileName = '',
+      pdfBase64 = '',
+      rawText = '',
+      caseNoHint = '',
+      pageTexts = [],
+      pageImages = []
+    } = req.body || {};
 
-    if (pdfBase64 && typeof pdfBase64 === 'string') {
-      const cleanedBase64 = pdfBase64.replace(/^data:application\/pdf;base64,/, '').trim();
-      if (cleanedBase64.length > 20) {
-        const pdfBuf = Buffer.from(cleanedBase64, 'base64');
-        const coordText = await extractCoordinateSortedTextFromPdf(pdfBuf);
-        if (coordText.trim().length > 0) {
-          combinedText = `${combinedText}\n${coordText}`.trim();
-        } else {
-          const streamText = await extractStreamTextWithPdfParse(pdfBuf);
-          combinedText = `${combinedText}\n${streamText}`.trim();
+    const perPageTexts: Array<{ page: number; text: string }> = [];
+    let totalPages = 0;
+
+    // 1. If client already extracted per-page texts or per-page PDF/image slices, process sequentially (Page 1 .. N)
+    const clientPageTexts: string[] = Array.isArray(pageTexts) ? pageTexts.map((t) => String(t || '')) : [];
+    const clientPageImages: string[] = Array.isArray(pageImages) ? pageImages.map((img) => String(img || '')) : [];
+
+    if (clientPageTexts.length > 0 || clientPageImages.length > 0) {
+      totalPages = Math.max(clientPageTexts.length, clientPageImages.length);
+      for (let idx = 0; idx < totalPages; idx++) {
+        const pNum = idx + 1;
+        let pText = (clientPageTexts[idx] || '').trim();
+        const pImgB64 = (clientPageImages[idx] || '').trim();
+
+        // If digital text on this page is sparse (< 20 chars) and we have the page's PDF/image slice, extract text from that page
+        if (pText.length < 20 && pImgB64) {
+          const cleanB64 = pImgB64.includes(',') ? pImgB64.split(',')[1].trim() : pImgB64;
+          const isPdfSlice = cleanB64.startsWith('JVBERi0');
+
+          if (isPdfSlice) {
+            try {
+              const sliceBuf = Buffer.from(cleanB64, 'base64');
+              const coordTxt = await extractCoordinateSortedTextFromPdf(sliceBuf);
+              if (coordTxt && coordTxt.trim().length >= 20) {
+                pText = coordTxt.trim();
+              } else {
+                const streamTxt = await extractStreamTextWithPdfParse(sliceBuf);
+                if (streamTxt && streamTxt.trim().length > pText.length) {
+                  pText = streamTxt.trim();
+                }
+              }
+            } catch (_) {
+              // Fall through to Vision OCR
+            }
+          }
+
+          if (pText.length < 20 && ai) {
+            try {
+              const pageMime = isPdfSlice
+                ? 'application/pdf'
+                : cleanB64.startsWith('iVBOR')
+                ? 'image/png'
+                : 'image/jpeg';
+              const ocrResp = await generateWithTimeout(
+                {
+                  model: 'gemini-flash-lite-latest',
+                  contents: [
+                    { inlineData: { mimeType: pageMime, data: cleanB64 } },
+                    `대한민국 법원 문서(${pNum}페이지)입니다. 사건번호, 관할법원, 담당 재판부(제O회생단독/파산부/민사부 등) 및 회생위원/사법보좌관/판사, 채무자(신청인/당사자) 성명, 보정기한, 그리고 이 페이지에 기재된 모든 보정명령·보정권고·결정사항 본문을 원문 그대로 빠짐없이 텍스트로 추출하십시오.`
+                  ],
+                  config: { maxOutputTokens: 4096, temperature: 0.1 }
+                },
+                18000
+              );
+              if (ocrResp?.text) {
+                pText = ocrResp.text.trim();
+              }
+            } catch (_) {
+              // ignore single page OCR timeout
+            }
+          }
+        }
+
+        if (pText) {
+          perPageTexts.push({ page: pNum, text: pText });
         }
       }
     }
 
+    // 2. If pdfBase64 was sent directly, sequentially parse every page (1 .. totalPages) on the server
+    if (perPageTexts.length === 0 && pdfBase64 && typeof pdfBase64 === 'string') {
+      const cleanedBase64 = pdfBase64.includes(',') ? pdfBase64.split(',')[1].trim() : pdfBase64.trim();
+      if (cleanedBase64.length > 20) {
+        const pdfBuf = Buffer.from(cleanedBase64, 'base64');
+
+        let srcPdfLibDoc: PDFDocument | null = null;
+        try {
+          srcPdfLibDoc = await PDFDocument.load(pdfBuf, { ignoreEncryption: true });
+          totalPages = srcPdfLibDoc.getPageCount();
+        } catch (_) {
+          srcPdfLibDoc = null;
+        }
+
+        let pdfjsDoc: any = null;
+        try {
+          const loadingTask = pdfjs.getDocument({
+            data: new Uint8Array(pdfBuf),
+            cMapUrl: CMAP_URL,
+            cMapPacked: true,
+            standardFontDataUrl: STANDARD_FONT_URL,
+            verbosity: 0
+          });
+          pdfjsDoc = await loadingTask.promise;
+          if (!totalPages || totalPages < pdfjsDoc.numPages) {
+            totalPages = pdfjsDoc.numPages;
+          }
+
+          for (let p = 1; p <= totalPages; p++) {
+            let singlePageText = '';
+            try {
+              const page = await pdfjsDoc.getPage(p);
+              const viewport = page.getViewport({ scale: 1.0 });
+              const textContent = await page.getTextContent();
+
+              const items: Array<{ str: string; x: number; y: number }> = [];
+              for (const raw of textContent.items as any[]) {
+                if (!raw || typeof raw.str !== 'string') continue;
+                const trimmed = raw.str.trim();
+                if (!trimmed) continue;
+                const tm = raw.transform || [1, 0, 0, 1, 0, 0];
+                const [vx, vy] = viewport.convertToViewportPoint(tm[4], tm[5]);
+                items.push({ str: trimmed, x: vx, y: vy });
+              }
+
+              items.sort((a, b) => a.y - b.y);
+              const rows: Array<Array<{ str: string; x: number; y: number }>> = [];
+              for (const it of items) {
+                if (rows.length === 0) {
+                  rows.push([it]);
+                } else {
+                  const cur = rows[rows.length - 1];
+                  if (Math.abs(it.y - cur[0].y) <= 4.5) {
+                    cur.push(it);
+                  } else {
+                    rows.push([it]);
+                  }
+                }
+              }
+
+              const linesOnPage: string[] = [];
+              for (const r of rows) {
+                r.sort((a, b) => a.x - b.x);
+                const lineStr = r.map((c) => c.str).join(' ').trim();
+                if (lineStr) linesOnPage.push(lineStr);
+              }
+              singlePageText = linesOnPage.join('\n').trim();
+              page.cleanup();
+            } catch (_) {
+              // ignore page error
+            }
+
+            // If page p is a scanned image page (< 20 chars of digital text), OCR page p using pdf-lib + Gemini
+            if (singlePageText.length < 20 && srcPdfLibDoc && ai) {
+              try {
+                const subDoc = await PDFDocument.create();
+                const [copied] = await subDoc.copyPages(srcPdfLibDoc, [p - 1]);
+                subDoc.addPage(copied);
+                const subBytes = await subDoc.save();
+                const subB64 = Buffer.from(subBytes).toString('base64');
+
+                const ocrResp = await generateWithTimeout(
+                  {
+                    model: 'gemini-flash-lite-latest',
+                    contents: [
+                      { inlineData: { mimeType: 'application/pdf', data: subB64 } },
+                      `대한민국 법원 문서(${p}페이지)입니다. 사건번호, 관할법원, 담당 재판부(제O회생단독/파산부/민사부 등) 및 회생위원/사법보좌관/판사, 채무자(신청인/당사자) 성명, 보정기한, 그리고 이 페이지에 기재된 모든 보정명령·보정권고·결정사항 본문을 원문 그대로 빠짐없이 텍스트로 추출하십시오.`
+                    ],
+                    config: { maxOutputTokens: 4096, temperature: 0.1 }
+                  },
+                  18000
+                );
+                if (ocrResp?.text) {
+                  singlePageText = ocrResp.text.trim();
+                }
+              } catch (_) {
+                // ignore single page OCR error
+              }
+            }
+
+            if (singlePageText) {
+              perPageTexts.push({ page: p, text: singlePageText });
+            }
+          }
+        } catch (_) {
+          const fallbackStream = await extractStreamTextWithPdfParse(pdfBuf);
+          if (fallbackStream.trim()) {
+            perPageTexts.push({ page: 1, text: fallbackStream.trim() });
+          }
+        } finally {
+          try {
+            await pdfjsDoc?.destroy();
+          } catch (_) {
+            // ignore
+          }
+        }
+      }
+    }
+
+    if (rawText && String(rawText).trim()) {
+      perPageTexts.unshift({ page: 0, text: String(rawText).trim() });
+    }
+
+    const sequentialText = perPageTexts
+      .map((pt) => (pt.page > 0 ? `[${pt.page}페이지]\n${pt.text}` : pt.text))
+      .join('\n\n');
+    const combinedText = perPageTexts.map((pt) => pt.text).join('\n');
     const source = `${fileName}\n${caseNoHint}\n${combinedText}`;
 
-    // 1. Extract Korean Court Case Number (e.g., 2026개회10482, 2025하단3021, 2026가단50192)
+    // -------------------------------------------------------------------------
+    // Deterministic Multi-Page Regex Extraction across ALL pages (Page 1 .. N)
+    // -------------------------------------------------------------------------
+
+    // 1. Extract Korean Court Case Number (supports spaces or hyphens, e.g. "2026 개회 11335", "2026개회10482", "2025하단3021")
     const caseNoMatch = source.match(
-      /(20\d{2})\s*(개회|하단|하면|하합|회단|회합|간회단|가단|가합|가소|나|다|카단|카합|타채|드단|드합|즈단|구단|구합|고단|고합|노|도)\s*(\d{1,7})/
+      /(20\d{2})\s*[-\s]*(개회|하단|하면|하합|회단|회합|간회단|가단|가합|가소|나|다|카단|카합|타채|드단|드합|즈단|구단|구합|고단|고합|노|도|차|차전|머|러|비|카기|카불|회확|하확)\s*[-\s]*(\d{1,7})/
     );
-    const caseYear = caseNoMatch ? caseNoMatch[1] : new Date().getFullYear().toString();
+    const caseYear = caseNoMatch ? caseNoMatch[1] : '';
     const caseCode = caseNoMatch ? caseNoMatch[2] : '개회';
     const caseSeq = caseNoMatch ? caseNoMatch[3] : '';
-    const extractedCaseNo = caseNoMatch ? `${caseYear}${caseCode}${caseSeq}` : caseNoHint.trim();
+    let extractedCaseNo = caseNoMatch ? `${caseYear}${caseCode}${caseSeq}` : caseNoHint.trim();
 
-    // Map case code to Korean legal case category
     const codeCategoryMap: Record<string, string> = {
       개회: '개인회생',
       하단: '개인파산',
@@ -1965,79 +2453,228 @@ app.post('/api/parse-court-doc', async (req, res) => {
       카단: '보전처분 (가압류/가처분)',
       타채: '채권압류 및 추심명령'
     };
-    const caseType = codeCategoryMap[caseCode] || '개인회생';
+    let caseType = codeCategoryMap[caseCode] || '개인회생';
 
-    // 2. Extract Court Name
+    // 2. Extract Court Name across all pages
     const courtMatch = source.match(
-      /(서울회생법원|수원회생법원|부산회생법원|서울중앙지방법원|서울동부지방법원|서울남부지방법원|서울북부지방법원|서울서부지방법원|인천지방법원|수원지방법원|의정부지방법원|춘천지방법원|대전지방법원|청주지방법원|대구지방법원|부산지방법원|울산지방법원|창원지방법원|광주지방법원|전주지방법원|제주지방법원)(?:\s*[가-힣]+지원)?/
+      /(서울회생법원|수원회생법원|부산회생법원|서울중앙지방법원|서울동부지방법원|서울남부지방법원|서울북부지방법원|서울서부지방법원|인천지방법원|수원지방법원|의정부지방법원|춘천지방법원|대전지방법원|청주지방법원|대구지방법원|부산지방법원|울산지방법원|창원지방법원|광주지방법원|전주지방법원|제주지방법원)(?:\s*[가-힣]{2,4}지원)?/
     );
-    const court = courtMatch ? courtMatch[0].trim() : '서울회생법원';
+    let court = courtMatch ? courtMatch[0].replace(/\s+/g, ' ').trim() : '서울회생법원';
 
     // 3. Extract Party / Client Name (채무자, 신청인, 원고 등)
-    const clientMatch =
-      source.match(/(?:채\s*무\s*자|신\s*청\s*인|원\s*고|당\s*사\s*자)\s*[:：]?\s*([가-힣]{2,5})/) ||
-      fileName.match(/([가-힣]{2,4})_(?:보정|개시|결정|사건)/);
-    const clientName = clientMatch ? clientMatch[1].trim() : '';
+    const invalidPartyWords = /^(?:소송대리인|법무법인|변호사|법무사|보정명령|보정권고|제출기한|재판부|회생위원|사법보좌관|결정|주문|이유)$/;
+    let clientName = '';
+    const partyMatches = [
+      ...source.matchAll(/(?:채\s*무\s*자|신\s*청\s*인|원\s*고|당\s*사\s*자)\s*(?:성\s*명)?\s*[:：]?\s*([가-힣]{2,5})/g)
+    ];
+    for (const pm of partyMatches) {
+      const candidate = pm[1].trim();
+      if (candidate && !invalidPartyWords.test(candidate)) {
+        clientName = candidate;
+        break;
+      }
+    }
+    if (!clientName) {
+      const fnMatch = fileName.match(/([가-힣]{2,4})[\s_-]*(?:보정|개시|결정|사건|개인회생|파산)/);
+      if (fnMatch && !invalidPartyWords.test(fnMatch[1])) {
+        clientName = fnMatch[1].trim();
+      }
+    }
 
-    // 4. Extract Judge / Division
-    const judgeMatch = source.match(/(제\s*\d+\s*(?:회생|파산|민사|가사)?\s*(?:단독|부)|회생위원\s*[가-힣]{2,4})/);
-    const judge = judgeMatch
-      ? judgeMatch[1].replace(/\s+/g, '')
-      : caseCode === '개회'
-      ? '제12회생단독'
-      : caseCode.startsWith('하')
-      ? '제3파산단독'
-      : '민사단독';
+    // 4. Extract Judge / Division / Commissioner across ALL pages (NO hardcoded '제12회생단독' fallback!)
+    const divisionMatch =
+      source.match(/(제\s*\d+\s*(?:회생|파산|민사|가사|행정|형사)\s*(?:단독|부|합의부))/) ||
+      source.match(/((?:회생|파산|민사|가사)\s*제?\s*\d+\s*(?:단독|부))/) ||
+      source.match(/(제\s*\d+\s*(?:단독|부))/);
+    const commissionerMatch = source.match(
+      /(?:회\s*생\s*위\s*원|파\s*산\s*관\s*재\s*인)\s*[:：]?\s*([가-힣]{2,5})?/
+    );
+    const judicialOfficerMatch = source.match(
+      /(?:사\s*법\s*보\s*좌\s*관|재\s*판\s*장\s*판\s*사|판\s*사)\s*[:：]?\s*([가-힣]{2,4})/
+    );
+
+    const judgeParts: string[] = [];
+    if (divisionMatch) {
+      judgeParts.push(divisionMatch[1].replace(/\s+/g, ''));
+    }
+    if (commissionerMatch) {
+      const roleName = commissionerMatch[0].includes('파산') ? '파산관재인' : '회생위원';
+      const person = (commissionerMatch[1] || '').trim();
+      const label =
+        person && !invalidPartyWords.test(person) ? `${roleName} ${person}` : roleName;
+      if (!judgeParts.includes(label)) judgeParts.push(label);
+    } else if (judicialOfficerMatch && judgeParts.length === 0) {
+      const person = (judicialOfficerMatch[1] || '').trim();
+      if (person && !invalidPartyWords.test(person)) {
+        judgeParts.push(`판사/사법보좌관 ${person}`);
+      }
+    }
+    let judge = judgeParts.join(' · ');
 
     // 5. Extract Document Type & Status
     let docType = '보정권고 / 보정명령';
     let status = '보정명령 대응중';
     let isUrgent = true;
-    if (/석명준비명령/.test(source)) {
+    if (/석\s*명\s*준\s*비\s*명\s*령/.test(source)) {
       docType = '석명준비명령';
       status = '보정명령 대응중';
-    } else if (/보정명령/.test(source)) {
+    } else if (/보\s*정\s*명\s*령/.test(source)) {
       docType = '보정명령';
       status = '보정명령 대응중';
-    } else if (/보정권고/.test(source)) {
+    } else if (/보\s*정\s*권\s*고/.test(source)) {
       docType = '보정권고';
       status = '보정권고 소명서 작성중';
-    } else if (/개시결정/.test(source)) {
+    } else if (/개\s*시\s*결\s*정/.test(source)) {
       docType = '개시결정 통지서';
       status = '개시결정 완료';
       isUrgent = false;
-    } else if (/채권자집회/.test(source)) {
+    } else if (/채\s*권\s*자\s*집\s*회/.test(source)) {
       docType = '채권자집회 기일통지서';
       status = '채권자집회 대기';
       isUrgent = true;
-    } else if (/인가결정/.test(source)) {
+    } else if (/인\s*가\s*결\s*정/.test(source)) {
       docType = '변제계획 인가결정';
       status = '변제계획 인가완료';
       isUrgent = false;
     }
 
-    // 6. Extract Deadline / Next Hearing
+    // 6. Extract Deadline / Next Hearing across all pages
     const deadlineMatch =
-      source.match(/(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?\s*(?:까지|기일|기한)?)/) ||
-      source.match(/(송달받은\s*날로부터\s*\d+\s*일\s*이내)/);
-    const nextDeadline = deadlineMatch
-      ? deadlineMatch[1].trim()
+      source.match(/(송달받은?\s*날로부터\s*\d+\s*일\s*이내)/) ||
+      source.match(/(명령을?\s*송달받은?\s*날부터\s*\d+\s*일\s*이내)/) ||
+      source.match(/((?:보정|제출|소명)\s*기한\s*[:：]?\s*20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?)/) ||
+      source.match(/(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?\s*(?:까지|기일|기한))/);
+    let nextDeadline = deadlineMatch
+      ? deadlineMatch[1].replace(/\s+/g, ' ').trim()
       : '송달일로부터 14일 이내 (보정기한)';
 
-    // 7. Extract Core Summary Content from PDF text
-    const lines = combinedText
+    // 7. Extract Threshold Hint (e.g. "50만원 이상", "30만원 이상", "100만원 이상")
+    let recommendedThreshold = 500000;
+    const threshMatch = source.match(/(\d{2,3})\s*만\s*원\s*이상/);
+    if (threshMatch) {
+      const manWon = parseInt(threshMatch[1], 10);
+      if (!isNaN(manWon) && manWon >= 10 && manWon <= 1000) {
+        recommendedThreshold = manWon * 10000;
+      }
+    }
+
+    // 8. Sequentially extract ALL numbered/bulleted order items across ALL pages (Page 1 .. N)
+    const rawLines = combinedText
       .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length >= 6 && !/^(페이지|Page|\d+\s*\/\s*\d+)$/i.test(l));
-    const orderLines = lines.filter((l) =>
-      /보정|소명|제출|내역|50만|입출금|카드|계좌|사용처|기일|결정|명령|권고/.test(l)
-    );
-    const summaryContent =
-      orderLines.length > 0
-        ? orderLines.slice(0, 4).join(' / ').slice(0, 260)
-        : combinedText.trim().length > 10
-        ? lines.slice(0, 3).join(' / ').slice(0, 240)
-        : `[${extractedCaseNo || '신규사건'}] 최근 1년간 은행 입출금 50만원 이상 및 카드 사용금액 50만원 이상 거래내역에 대한 소명자료를 기한 내 제출하시기 바랍니다.`;
+      .map((l) => l.replace(/\s+/g, ' ').trim())
+      .filter((l) => l.length >= 4 && !/^(?:페이지|Page|-?\s*\d+\s*-?|\d+\s*\/\s*\d+)$/i.test(l));
+
+    const orderItems: string[] = [];
+    const numberedItemRegex =
+      /^(?:(?:\d{1,2}|[가-하]|[①-⑳]|[Ⅰ-Ⅹ])[.)]\s*|(?:\[\s*(?:보정|흠결|명령|제출|소명)[^\]]*\]|\(\d{1,2}\)|[■□○●◈▶-]\s+))/;
+    const orderKeywordRegex =
+      /보정|소명|제출|거래내역|입출금|계좌|카드|사용처|청산가치|변제계획|수입|생계비|부양가족|보험|임대차|재산목록|채권자|대출|소명자료|내역서/;
+
+    for (const line of rawLines) {
+      // Skip boilerplate header/footer lines
+      if (/^(?:우편번호|주소\s*[:]|전화\s*[:]|팩스\s*[:]|전자통신망|대법원\s*전자소송)/.test(line)) continue;
+      if (numberedItemRegex.test(line) || (orderKeywordRegex.test(line) && line.length >= 10)) {
+        if (!orderItems.includes(line)) {
+          orderItems.push(line);
+        }
+      }
+    }
+
+    let summaryContent =
+      orderItems.length > 0
+        ? orderItems.slice(0, 15).join('\n')
+        : rawLines.length > 0
+        ? rawLines.slice(0, 10).join('\n')
+        : '';
+
+    // 9. AI Multi-Page Structured Synthesis (analyzes the full sequential text from Page 1 .. N)
+    if (ai && sequentialText.trim().length >= 15) {
+      try {
+        const aiPrompt = `다음은 대한민국 법원 문서("${fileName}", 총 ${totalPages || perPageTexts.length || 1}페이지 전체 순차 추출본)의 전체 페이지 원문입니다.
+1페이지부터 마지막 페이지까지 모든 페이지를 빠짐없이 분석하여 아래 JSON 형식으로만 정확히 추출하십시오. 문서에 없는 재판부명(예: 제12회생단독 등)을 임의로 지어내지 말고, 실제 문서에 기재된 재판부/회생위원/판사만 기재하십시오(없으면 빈 문자열 "").
+
+[전체 페이지 원문]:
+${sequentialText.slice(0, 28000)}
+
+출력 JSON 스키마 (순수 JSON만 출력):
+{
+  "caseNo": "사건번호 (예: 2026개회11335, 없으면 빈 문자열)",
+  "clientName": "채무자/신청인/당사자 성명 (예: 이현, 없으면 빈 문자열)",
+  "court": "관할법원 정식명칭 (예: 서울회생법원)",
+  "caseType": "사건종류 (예: 개인회생, 개인파산·면책, 법인회생, 민사 본안 등)",
+  "status": "진행상태 (보정명령 대응중, 보정권고 소명서 작성중, 개시결정 완료, 채권자집회 대기, 변제계획 인가완료 중 택1)",
+  "judge": "문서에 실제 기재된 담당 재판부 및 회생위원/판사/사법보좌관 (예: 제3회생단독 · 회생위원 김철수, 문서에 없으면 반드시 빈 문자열)",
+  "docType": "문서종류 (보정명령, 보정권고, 석명준비명령, 개시결정 통지서, 인가결정 등)",
+  "nextDeadline": "보정기한 또는 차기기일 (예: 송달받은 날로부터 14일 이내, 2026-11-30 등)",
+  "thresholdAmount": 500000,
+  "orderItems": [
+    "1페이지~마지막페이지에 기재된 각 보정명령/권고/결정 핵심 항목 1",
+    "항목 2",
+    "항목 3"
+  ],
+  "summaryContent": "전체 페이지의 보정명령·권고 핵심 요지 종합 요약 (번호별 줄바꿈 포함)"
+}`;
+
+        const aiResp = await generateWithTimeout(
+          {
+            model: 'gemini-flash-lite-latest',
+            contents: aiPrompt,
+            config: { maxOutputTokens: 4096, temperature: 0.1 }
+          },
+          18000
+        );
+
+        const rawJson = (aiResp?.text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+        const jsonMatch = rawJson.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsedAi = JSON.parse(jsonMatch[0]);
+          if (parsedAi.caseNo && String(parsedAi.caseNo).trim()) {
+            extractedCaseNo = String(parsedAi.caseNo).replace(/\s+/g, '').trim();
+          }
+          if (parsedAi.clientName && String(parsedAi.clientName).trim()) {
+            clientName = String(parsedAi.clientName).trim();
+          }
+          if (parsedAi.court && String(parsedAi.court).trim()) {
+            court = String(parsedAi.court).trim();
+          }
+          if (parsedAi.caseType && String(parsedAi.caseType).trim()) {
+            caseType = String(parsedAi.caseType).trim();
+          }
+          if (parsedAi.status && String(parsedAi.status).trim()) {
+            status = String(parsedAi.status).trim();
+          }
+          if (typeof parsedAi.judge === 'string' && parsedAi.judge.trim()) {
+            judge = parsedAi.judge.trim();
+          }
+          if (parsedAi.docType && String(parsedAi.docType).trim()) {
+            docType = String(parsedAi.docType).trim();
+          }
+          if (parsedAi.nextDeadline && String(parsedAi.nextDeadline).trim()) {
+            nextDeadline = String(parsedAi.nextDeadline).trim();
+          }
+          if (Number(parsedAi.thresholdAmount) >= 100000) {
+            recommendedThreshold = Number(parsedAi.thresholdAmount);
+          }
+          if (Array.isArray(parsedAi.orderItems) && parsedAi.orderItems.length > 0) {
+            const cleanItems = parsedAi.orderItems.map((it: any) => String(it || '').trim()).filter(Boolean);
+            if (cleanItems.length > 0) {
+              orderItems.splice(0, orderItems.length, ...cleanItems);
+            }
+          }
+          if (parsedAi.summaryContent && String(parsedAi.summaryContent).trim()) {
+            summaryContent = String(parsedAi.summaryContent).trim();
+          } else if (orderItems.length > 0) {
+            summaryContent = orderItems.join('\n');
+          }
+        }
+      } catch (_) {
+        // Fallback to deterministic multi-page regex results already computed above
+      }
+    }
+
+    if (!summaryContent) {
+      summaryContent = `[${extractedCaseNo || '법원문서'}] 전체 ${totalPages || 1}페이지 분석 완료 — 은행 입출금 및 카드 사용내역 소명자료 제출 대상`;
+    }
 
     return res.json({
       caseNo: extractedCaseNo,
@@ -2049,6 +2686,9 @@ app.post('/api/parse-court-doc', async (req, res) => {
       docType,
       nextDeadline,
       isUrgent,
+      pageCount: totalPages || perPageTexts.length || 1,
+      thresholdAmount: recommendedThreshold,
+      orderItems,
       summaryContent
     });
   } catch (err) {

@@ -14,7 +14,7 @@
       "destination": "/api/index"
     },
     {
-      "source": "/((?!api/).*)",
+      "source": "/((?!api/|pdfjs/|assets/).*)",
       "destination": "/index.html"
     }
   ]
